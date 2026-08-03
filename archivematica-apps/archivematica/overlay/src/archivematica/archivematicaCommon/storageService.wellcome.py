@@ -37,6 +37,10 @@ LOGGER = logging.getLogger("archivematica.common")
 ASYNC_OBSERVATION_DEADLINE_SECONDS = 24 * 60 * 60
 ASYNC_POLL_TIMEOUT_SECONDS = 600
 ASYNC_MAX_POLL_INTERVAL_SECONDS = ASYNC_POLL_TIMEOUT_SECONDS / 2
+INTERRUPTED_ASYNC_ERROR_MESSAGE = (
+    "The asynchronous operation was interrupted after its heartbeat expired. "
+    "Its final outcome is unknown; do not retry it automatically."
+)
 
 
 class Error(requests.exceptions.RequestException):
@@ -169,6 +173,17 @@ def _storage_relative_from_absolute(location_path, space_path):
             strip += 1
         location_path = location_path[strip:]
     return location_path
+
+
+def _is_interrupted_async_error(error):
+    """Recognize Storage Service's unstructured interruption response.
+
+    Storage Service commit 34e5a9f0 reports an interrupted operation as a
+    serialized exception without a structured error code. Match the complete
+    canonical message suffix so compatibility does not depend on the serialized
+    exception-class prefix or classify unrelated errors as outcome unknown.
+    """
+    return isinstance(error, str) and error.endswith(INTERRUPTED_ASYNC_ERROR_MESSAGE)
 
 
 # ########### PIPELINE #############
@@ -449,6 +464,19 @@ def wait_for_async(response, *, operation):
             continue
 
         if was_error:
+            if _is_interrupted_async_error(remote_error):
+                err = AsyncOutcomeUnknown(
+                    operation=operation,
+                    async_id=async_id,
+                    poll_url=poll_url,
+                    elapsed_seconds=elapsed_seconds(),
+                    reason=(
+                        "Storage Service reported an interrupted operation: "
+                        f"{remote_error}"
+                    ),
+                )
+                LOGGER.error("%s", err)
+                raise err
             errmsg = (
                 f"Storage Service async operation {async_id} for {operation} "
                 f"reported failure: {remote_error}"
